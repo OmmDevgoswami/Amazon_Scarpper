@@ -7,15 +7,7 @@ import re
 import os
 from pathlib import Path
 from datetime import datetime
-
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-
+import requests
 from bs4 import BeautifulSoup
 import smtplib
 from email.mime.text import MIMEText
@@ -27,8 +19,6 @@ from email.mime.multipart import MIMEMultipart
 APP_DIR = Path(__file__).parent
 CSV_PATH = APP_DIR / "bestsellers_latest.csv"
 MAX_PRICE = 500  # change to 1000 if you want; spec asked for under ₹500
-SCROLL_STEPS = 6
-HEADLESS = True
 
 CATEGORIES = {
     "Books": "https://www.amazon.in/gp/bestsellers/books/",
@@ -44,195 +34,107 @@ CATEGORIES = {
 
 st.set_page_config(page_title="Amazon DealHunter — Best Sellers < ₹500", layout="wide")
 st.title("🛍️ Amazon DealHunter — Best Sellers under ₹500")
-st.caption("Selenium + BeautifulSoup powered scraper — safer delays, better selectors, CSV caching, email alerts")
-
-# ----------------------------
-# UTIL: driver init
-# ----------------------------
-def init_driver(headless=True):
-    options = Options()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--start-maximized")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    # make it a bit more stealthy
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--log-level=3")
-    # random user agent helps a little
-    ua_list = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15"
-    ]
-    options.add_argument(f"--user-agent={random.choice(ua_list)}")
-
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    return driver
+st.caption("Requests + BeautifulSoup powered scraper — faster, Streamlit Cloud friendly, CSV caching, email alerts")
 
 # ----------------------------
 # UTIL: parse price text to float (INR)
 # ----------------------------
 def parse_price_text(price_text):
-    """
-    Extract numeric price value from amazon price snippet.
-    Returns float or None.
-    """
     if not price_text or not isinstance(price_text, str):
         return None
-    # remove non-numeric except dots and commas
-    # unified approach: extract all digits, commas, dots then normalize
-    # typical price text: "₹499", "₹ 1,199", "1,299.00"
-    # find chunk with digits/.,,
     m = re.search(r"[\d\.,]+", price_text.replace("\u20B9", ""))
     if not m:
         return None
-    raw = m.group(0)
-    raw = raw.replace(",", "")
+    raw = m.group(0).replace(",", "")
     try:
         return float(raw)
     except:
         return None
 
 # ----------------------------
-# SCRAPER: get_best_sellers for a single category url
+# SCRAPER: get_best_sellers for a single category url (requests version)
 # ----------------------------
-def get_best_sellers(url, max_price=MAX_PRICE, scroll_steps=SCROLL_STEPS, headless=HEADLESS):
-    """
-    Returns list of dicts: {Product Name, Price (₹), Rating, URL}
-    """
-    driver = None
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/115.0 Safari/537.36"
+}
+
+def get_best_sellers(url, max_price=MAX_PRICE):
+    products = []
     try:
-        driver = init_driver(headless=headless)
-        driver.set_page_load_timeout(30)
-        driver.get(url)
-        # wait for something sensible to appear: the bestseller container
-        try:
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div.zg-grid-general-faceout, div.p13n-sc-uncoverable-faceout, ol#zg-ordered-list"))
-            )
-        except Exception:
-            # keep going; some pages still show content with JS slower
-            pass
-
-        # Slowly scroll to bottom to force lazy loading
-        last_height = driver.execute_script("return document.body.scrollHeight")
-        for i in range(scroll_steps):
-            # scroll by fraction
-            driver.execute_script(f"window.scrollTo(0, document.body.scrollHeight * {(i+1)/scroll_steps});")
-            time.sleep(random.uniform(1.2, 2.4))
-
-        # final small scrolls to trigger dynamic load
-        for _ in range(2):
-            driver.execute_script("window.scrollBy(0, 400);")
-            time.sleep(1.0)
-
-        html = driver.page_source
-        soup = BeautifulSoup(html, "html.parser")
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
         # multiple fallback containers
         product_nodes = []
         product_nodes += soup.select(".p13n-sc-uncoverable-faceout")
         product_nodes += soup.select(".zg-grid-general-faceout")
-        product_nodes += soup.select("ol#zg-ordered-list li")  # older layout
-        product_nodes += soup.select(".a-section.a-spacing-none.aok-relative")  # some layouts
+        product_nodes += soup.select("ol#zg-ordered-list li")
+        product_nodes += soup.select(".a-section.a-spacing-none.aok-relative")
 
-        # dedupe nodes (by href or text)
         seen = set()
-        products = []
         for node in product_nodes:
-            # attempt to find name
             name_tag = node.select_one("._cDEzb_p13n-sc-css-line-clamp-3_g3dy1, .p13n-sc-truncate, .a-link-normal.a-text-normal, .zg-item a.a-link-normal")
-            # price fallbacks
             price_tag = node.select_one(".p13n-sc-price, .a-price-whole, .a-color-price")
-            # rating fallbacks
             rating_tag = node.select_one(".a-icon-alt, .a-link-normal .a-icon-alt, .zg-badge-text")
             link_tag = node.select_one("a.a-link-normal, a.a-link-normal.a-text-normal")
 
-            # fallback: try to locate a link containing '/dp/' (ASIN)
             if not link_tag:
                 link_tag = node.find("a", href=re.compile(r"/dp/"))
 
-            # get url
             url_val = None
             if link_tag and link_tag.has_attr("href"):
                 href = link_tag["href"]
-                if href.startswith("http"):
-                    url_val = href
-                else:
-                    url_val = "https://www.amazon.in" + href.split("?")[0]
+                url_val = href if href.startswith("http") else "https://www.amazon.in" + href.split("?")[0]
 
-            # define name
-            name = None
-            if name_tag:
-                name = name_tag.get_text(strip=True)
-            else:
-                # try text inside link
-                if link_tag:
-                    name = link_tag.get_text(strip=True)
+            name = name_tag.get_text(strip=True) if name_tag else (link_tag.get_text(strip=True) if link_tag else None)
             if not name:
                 continue
 
-            # protect duplicates
             uniq = (name[:80], url_val)
             if uniq in seen:
                 continue
             seen.add(uniq)
 
-            # price parsing: sometimes price in sibling nodes
             price = parse_price_text(price_tag.get_text(strip=True)) if price_tag else None
             if price is None:
-                # search nearby spans that look like price
                 sibling_price = node.find(text=re.compile(r"₹\s*\d"))
                 if sibling_price:
                     price = parse_price_text(sibling_price)
 
-            # skip if price missing or above threshold
             if price is None or price > max_price:
                 continue
 
             rating = rating_tag.get_text(strip=True) if rating_tag else "N/A"
-
             products.append({
                 "Product Name": name,
                 "Price (₹)": price,
                 "Rating": rating,
                 "URL": url_val or "N/A"
             })
-
         return products
     except Exception as e:
-        # log to streamlit console area if available
         st.write(f"Scrape error for {url}: {e}")
         return []
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except:
-                pass
 
 # ----------------------------
 # COMBINE ALL CATEGORIES
 # ----------------------------
-def scrape_all_categories(categories=CATEGORIES, max_price=MAX_PRICE, headless=HEADLESS):
+def scrape_all_categories(categories=CATEGORIES, max_price=MAX_PRICE):
     all_items = []
     total = len(categories)
     for i, (cat_name, cat_url) in enumerate(categories.items(), start=1):
         st.info(f"📦 Scraping {cat_name} ({i}/{total}) ...")
-        items = get_best_sellers(cat_url, max_price=max_price, headless=headless)
+        items = get_best_sellers(cat_url, max_price=max_price)
         for it in items:
             it["Category"] = cat_name
         all_items.extend(items)
-        # small random sleep between categories so Amazon doesn't detect pattern
-        time.sleep(random.uniform(1.5, 3.0))
+        time.sleep(random.uniform(1.0, 2.0))  # delay to mimic human
     return pd.DataFrame(all_items)
 
 # ----------------------------
-# EMAIL SENDER (simple HTML)
+# EMAIL SENDER (same)
 # ----------------------------
 def send_email_html(df: pd.DataFrame, sender_email: str, sender_pass: str, receiver_email: str, subject=None):
     subject = subject or f"Amazon DealHunter — Top {len(df)} deals under ₹{MAX_PRICE} ({datetime.now().date()})"
@@ -264,10 +166,9 @@ def send_email_html(df: pd.DataFrame, sender_email: str, sender_pass: str, recei
         return False, str(e)
 
 # ----------------------------
-# STREAMLIT UI
+# STREAMLIT UI (unchanged)
 # ----------------------------
 st.sidebar.header("Settings")
-headless_toggle = st.sidebar.checkbox("Run headless (faster)", value=True)
 price_limit = st.sidebar.number_input("Max price (₹)", min_value=1, max_value=10000, value=MAX_PRICE, step=50)
 use_cache = st.sidebar.checkbox("Load cached CSV if available (faster)", value=True)
 auto_email = st.sidebar.checkbox("Auto-send email after scrape (top 10 deals)", value=False)
@@ -279,16 +180,15 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.subheader("🔥 Run a live scrape")
     if st.button("🔁 Refresh Best Sellers (live scrape)"):
-        with st.spinner("Scraping categories — this may take 30-90s depending on connection..."):
-            df = scrape_all_categories(max_price=price_limit, headless=headless_toggle)
+        with st.spinner("Scraping categories — this may take 10-30s depending on connection..."):
+            df = scrape_all_categories(max_price=price_limit)
             if df.empty:
-                st.warning("No items found under the price threshold. Try increasing the price or lowering headless=True.")
+                st.warning("No items found under the price threshold. Try increasing the price.")
             else:
                 df = df.sort_values(by="Price (₹)").reset_index(drop=True)
                 st.success(f"Found {len(df)} items under ₹{price_limit} across categories")
                 st.dataframe(df, width=1000)
 
-                # save CSV cache
                 try:
                     df.to_csv(CSV_PATH, index=False)
                     st.info(f"Saved latest results to {CSV_PATH}")
@@ -297,7 +197,6 @@ with col1:
 
                 st.session_state["latest_df"] = df
 
-                # auto-email
                 if auto_email:
                     top_email_df = df.nsmallest(10, "Price (₹)")
                     sender = st.text_input("Sender Email (Gmail) for sending", key="auto_sender")
@@ -310,7 +209,7 @@ with col1:
                         else:
                             st.error(f"Auto-email failed: {msg}")
                     else:
-                        st.info("Provide sender/receiver credentials in the fields to auto-send email.")
+                        st.info("Provide sender/receiver credentials to auto-send email.")
 
 with col2:
     st.subheader("Quick load / Email")
@@ -345,12 +244,10 @@ st.markdown("---")
 st.subheader("Top cheap gems")
 if "latest_df" in st.session_state and not st.session_state["latest_df"].empty:
     df_show = st.session_state["latest_df"].nsmallest(12, "Price (₹)").copy()
-    # make links clickable
     df_show["Product"] = df_show.apply(lambda r: f"[{r['Product Name']}]({r['URL']})", axis=1)
     display_df = df_show[["Product", "Price (₹)", "Rating", "Category"]]
     st.write("Top 12 cheapest items across scraped categories:")
     st.table(display_df.to_dict(orient="records"))
-    # visual small cards
     st.markdown("#### Quick view")
     for _, row in df_show.iterrows():
         st.markdown(f"**[{row['Product Name']}]({row['URL']})** — ₹{row['Price (₹)']} • {row['Rating']} • `{row['Category']}`")
